@@ -261,11 +261,29 @@ class Kernel(threading.Thread):
                      'stdout': self.stdout_h,
                      'stderr': self.stderr_h,
                      'status': self.status_h,
-                     'display_data': self.display_data_h}
+                     'display_data': self.display_data_h,
+                     'complete_reply': self.complete_reply_h}
 
     def interrupt(self):
         if sublime.platform() != "windows":
             self.kernel.send_signal(2)
+            
+    def complete(self, code):
+        code = code[:-1]
+        complete_request = Msg(["complete_request"],
+            {"msg_id": str(uuid.uuid4()), 
+             "username": str(self.id), 
+             "session": str(uuid.uuid4()), 
+             "msg_type": "complete_request"}, 
+             {"text": "", 
+              "line": code,
+              "cursor_pos": len(code)-1,
+              "silent": False, 
+              "store_history": False, 
+              "user_variables": list(), 
+              "user_expressions": {}, 
+              "allow_stdin": True}, {})
+        ret = self.shell.send(complete_request)
 
     def execute(self, code):
         if debug:
@@ -322,6 +340,17 @@ class Kernel(threading.Thread):
         count = m.content['execution_count']
         data = m.content['data']['text/plain']
         return count, data
+    
+    def get_complete_reply(self):
+        m = self.shell.recv()
+        
+        # make sure it is the one we want
+        if (m.header['msg_type'] != "complete_reply"):
+            return None, None
+        
+        matches = m.content['matches']
+        matched_text = m.content['matched_text']
+        return matches, matched_text
 
     def get_stdout(self):
         m = self.sub.recv()
@@ -368,6 +397,22 @@ class Kernel(threading.Thread):
         count, data = self.get_execute_reply()
         self.jv.output(count,data)
         return 1
+    
+    def complete_reply_h(self):
+        matches, matched_text = self.get_complete_reply()
+        if matches:
+            # show the information
+            outStr = "  ".join(matches) + "\n"
+            self.jv.stdout_output( outStr )
+            
+            # ask for input
+            self.jv.in_output()
+            self.jv._view.set_status("kernel","")
+            self.idle = True
+            
+            return 1
+        else:
+            return 0
 
     def pyerr_h(self):
         count, data = self.get_error_reply()
@@ -406,10 +451,20 @@ class Kernel(threading.Thread):
         while True:
             if self.idle and not q.empty():
                 code = q.get_nowait()
-                self.execute(code)
-            self.shell.recv_msg()
+
+                if "str" in code:
+                    self.complete(code)
+                else:
+                    self.execute(code)
+                    
+            s = self.shell.recv_msg()
             m = self.sub.recv_msg()
+            
             r = self.handlers.get(m, self.pyin_h)()
+
+            if s != "":
+                self.handlers.get(s, self.complete_reply_h)()
+            
             if r:
                 l = 5
             else:
